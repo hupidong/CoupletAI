@@ -25,6 +25,7 @@ def get_args():
     parser.add_argument("--max_seq_len", default=32, type=int)
     parser.add_argument("--lr", default=0.001, type=float)
     parser.add_argument("--no_cuda", action='store_true')
+    parser.add_argument('--device', help='0|1|...')
     parser.add_argument("-m", "--model", default='transformer', type=str)
     parser.add_argument("--fp16", action='store_true')
     parser.add_argument("--fp16_opt_level", default='O1', type=str)
@@ -55,7 +56,7 @@ def auto_evaluate(model, testloader, tokenizer):
     model.eval()
     for step, batch in enumerate(testloader):
         input_ids, masks, lens = tuple(t.to(device) for t in batch[:-1])
-        target_ids = batch[-1]
+        target_ids = batch[-1].to(device)
         with torch.no_grad():
             logits = model(input_ids, masks)
             # preds.shape=(batch_size, max_seq_len)
@@ -77,10 +78,16 @@ def auto_evaluate(model, testloader, tokenizer):
 
 def predict_demos(model, tokenizer: Tokenizer):
     demos = [
-        "马齿草焉无马齿", "天古天今，地中地外，古今中外存天地"
+        "马齿草焉无马齿", "天古天今，地中地外，古今中外存天地",
+        "风弦未拨心先乱", "花梦粘于春袖口",
+        "彩屏如画，望秀美崤函，花 团 锦 簇",
+        "五月榴花照眼明"
     ]
     target = [
-        "猫头鹰好像猫头", "湖南湖北， 山东山西，南北东西有湖山"
+        "猫头鹰好像猫头", "湖南湖北，山东山西，南北东西有湖山",
+        "夜幕已沉梦更闲","莺声溅落柳枝头",
+        "短信报春，喜和谐社会，物阜民康",
+        "颠倒青苔落绛英"
     ]
     sents = [torch.tensor(tokenizer.encode(sent)).unsqueeze(0) for sent in demos]
     model.eval()
@@ -107,7 +114,9 @@ def run():
     args = get_args()
     fdir = Path(args.dir)
     tb = SummaryWriter(args.logdir)
-    device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
+    if args.no_cuda:
+        assert args.device.isdigit(), 'no gpu device selected.'
+    device = torch.device("cuda:{}".format(args.device) if torch.cuda.is_available() and not args.no_cuda else "cpu")
     output_dir = Path(args.output)
     output_dir.mkdir(exist_ok=True, parents=True)
     logger.info(args)
