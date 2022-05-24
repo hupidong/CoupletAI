@@ -1,19 +1,17 @@
 import argparse
 import logging
-from pathlib import Path
 import time
+from pathlib import Path
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
 
-from nltk.translate.bleu_score import sentence_bleu
-
-from module.model import BiLSTM, Transformer, CNN, BiLSTMAttn, BiLSTMCNN, BiLSTMConvAttRes
 from module import Tokenizer, init_model_by_key
-from module.metric import calc_bleu, calc_rouge_l
+from module.metric import calc_bleu, calc_rouge_l, accuracy
 
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(levelname)s - %(message)s')
@@ -47,9 +45,12 @@ def get_args():
     parser.add_argument("--hidden_drop", default=0.1, type=float)
     return parser.parse_args()
 
+
 def auto_evaluate(model, testloader, tokenizer):
     bleus = []
     rls = []
+    correct = 0
+    total = 0
     device = next(model.parameters()).device
     model.eval()
     for step, batch in enumerate(testloader):
@@ -58,7 +59,7 @@ def auto_evaluate(model, testloader, tokenizer):
         with torch.no_grad():
             logits = model(input_ids, masks)
             # preds.shape=(batch_size, max_seq_len)
-            _, preds = torch.max(logits, dim=-1) 
+            _, preds = torch.max(logits, dim=-1)
         for seq, tag in zip(preds.tolist(), target_ids.tolist()):
             seq = list(filter(lambda x: x != tokenizer.pad_id, seq))
             tag = list(filter(lambda x: x != tokenizer.pad_id, tag))
@@ -66,14 +67,20 @@ def auto_evaluate(model, testloader, tokenizer):
             rl = calc_rouge_l(seq, tag)
             bleus.append(bleu)
             rls.append(rl)
-    return sum(bleus) / len(bleus), sum(rls) / len(rls)
 
-def predict_demos(model, tokenizer:Tokenizer):
+        _, cor, tot = accuracy(y_pred=preds, y_true=target_ids, PAD_IDX=tokenizer.pad_id)
+        correct += cor
+        total += tot
+
+    return sum(bleus) / len(bleus), sum(rls) / len(rls), float(correct)/total
+
+
+def predict_demos(model, tokenizer: Tokenizer):
     demos = [
-        "马齿草焉无马齿", "天古天今，地中地外，古今中外存天地", 
-        "笑取琴书温旧梦", "日里千人拱手划船，齐歌狂吼川江号子",
-        "我有诗情堪纵酒", "我以真诚溶冷血",
-        "三世业岐黄，妙手回春人共赞"
+        "马齿草焉无马齿", "天古天今，地中地外，古今中外存天地"
+    ]
+    target = [
+        "猫头鹰好像猫头", "湖南湖北， 山东山西，南北东西有湖山"
     ]
     sents = [torch.tensor(tokenizer.encode(sent)).unsqueeze(0) for sent in demos]
     model.eval()
@@ -84,7 +91,8 @@ def predict_demos(model, tokenizer:Tokenizer):
             logits = model(sent).squeeze(0)
         pred = logits.argmax(dim=-1).tolist()
         pred = tokenizer.decode(pred)
-        logger.info(f"上联：{demos[i]}。 预测的下联：{pred}")
+        logger.info(f"上联：{demos[i]}\n 预测的下联：{pred}\n 真正的下联：{target[i]}")
+
 
 def save_model(filename, model, args, tokenizer):
     info_dict = {
@@ -93,6 +101,7 @@ def save_model(filename, model, args, tokenizer):
         'tokenzier': tokenizer
     }
     torch.save(info_dict, filename)
+
 
 def run():
     args = get_args()
@@ -110,6 +119,7 @@ def run():
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
     test_loader = DataLoader(test_dataset, batch_size=args.batch_size)
     logger.info(f"initializing model...")
+    # TODO reload checkpoint
     model = init_model_by_key(args, tokenizer)
     model.to(device)
     loss_function = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_id)
@@ -126,12 +136,12 @@ def run():
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min')
     logger.info(f"num gpu: {torch.cuda.device_count()}")
     global_step = 0
-    for epoch in range(args.epochs):
+    for epoch in tqdm(range(args.epochs)):
         logger.info(f"***** Epoch {epoch} *****")
         model.train()
         t1 = time.time()
         accu_loss = 0.0
-        for step, batch in enumerate(train_loader):
+        for step, batch in tqdm(enumerate(train_loader)):
             optimizer.zero_grad()
             batch = tuple(t.to(device) for t in batch)
             input_ids, masks, lens, target_ids = batch
@@ -152,19 +162,21 @@ def run():
             if step % 100 == 0:
                 tb.add_scalar('loss', loss.item(), global_step)
                 logger.info(
-                    f"[epoch]: {epoch}, [batch]: {step}, [loss]: {loss.item()}")
+                    f"[epoch]: {epoch}/{args.epochs}, [batch]: {step}/{len(train_loader)}, [loss]: {loss.item()}")
             global_step += 1
         scheduler.step(accu_loss)
         t2 = time.time()
-        logger.info(f"epoch time: {t2-t1:.5}, accumulation loss: {accu_loss:.6}")
+        logger.info(f"epoch time: {t2 - t1:.5}, accumulation loss: {accu_loss:.6}")
+        # TODO 优化测试和保存模型的代码
         if (epoch + 1) % args.test_epoch == 0:
             predict_demos(model, tokenizer)
-            bleu, rl = auto_evaluate(model, test_loader, tokenizer)
-            logger.info(f"BLEU: {round(bleu, 9)}, Rouge-L: {round(rl, 8)}")
+            bleu, rl, acc = auto_evaluate(model, test_loader, tokenizer)
+            logger.info(f"BLEU: {round(bleu, 9)}, Rouge-L: {round(rl, 8)}, ACC: {round(acc, 8)}")
         if (epoch + 1) % args.save_epoch == 0:
             filename = f"{model.__class__.__name__}_{epoch + 1}.bin"
             filename = output_dir / filename
             save_model(filename, model, args, tokenizer)
+
 
 if __name__ == "__main__":
     run()
